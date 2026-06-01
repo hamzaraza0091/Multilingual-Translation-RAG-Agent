@@ -1,62 +1,32 @@
 from __future__ import annotations
 
 import uuid
-from dataclasses import dataclass, field
 from typing import Optional
 
-import numpy as np
 from sentence_transformers import SentenceTransformer
-
-
-@dataclass
-class Chunk:
-    id: str
-    text: str
-    embedding: np.ndarray
-    metadata: dict = field(default_factory=dict)
+import chromadb
+from chromadb.config import Settings
 
 
 class RAGStore:
 
-    def __init__(self, chunk_size: int = 120, overlap: int = 30):
-        self.chunks: list[Chunk] = []
-        self.chunk_size = chunk_size
-        self.overlap = overlap
+    def __init__(self):
 
-        # FREE LOCAL EMBEDDING MODEL
+        # Embedding model
         self.model = SentenceTransformer(
             "all-MiniLM-L6-v2"
         )
 
-    # ─────────────────────────────
-
-    def _split_chunks(self, text: str) -> list[str]:
-        words = text.split()
-
-        chunks = []
-        i = 0
-
-        while i < len(words):
-            chunk = " ".join(
-                words[i:i + self.chunk_size]
-            )
-
-            chunks.append(chunk)
-
-            i += self.chunk_size - self.overlap
-
-        return chunks
-
-    # ─────────────────────────────
-
-    @staticmethod
-    def _cosine(a, b):
-        return np.dot(a, b) / (
-            np.linalg.norm(a) *
-            np.linalg.norm(b)
+        # Persistent ChromaDB
+        self.client = chromadb.PersistentClient(
+            path="./chroma_db"
         )
 
-    # ─────────────────────────────
+        self.collection = self.client.get_or_create_collection(
+            name="translations"
+        )
+
+    # --------------------------------------------------
 
     def add_document(
         self,
@@ -65,65 +35,70 @@ class RAGStore:
         metadata: Optional[dict] = None,
     ):
 
-        combined = f"{original}\n{translation}"
+        text = f"{original}\n{translation}"
 
-        raw_chunks = self._split_chunks(combined)
+        embedding = self.model.encode(text).tolist()
 
-        added = 0
-
-        for text in raw_chunks:
-
-            embedding = self.model.encode(text)
-
-            self.chunks.append(
-                Chunk(
-                    id=str(uuid.uuid4()),
-                    text=text,
-                    embedding=embedding,
-                    metadata=metadata or {},
-                )
-            )
-
-            added += 1
-
-        return added
-
-    # ─────────────────────────────
-
-    def retrieve(self, query: str, top_k: int = 3):
-
-        if not self.chunks:
-            return []
-
-        query_embedding = self.model.encode(query)
-
-        scored = []
-
-        for chunk in self.chunks:
-
-            score = self._cosine(
-                query_embedding,
-                chunk.embedding
-            )
-
-            scored.append({
-                "text": chunk.text,
-                "score": float(score),
-                "metadata": chunk.metadata,
-            })
-
-        scored.sort(
-            key=lambda x: x["score"],
-            reverse=True
+        self.collection.add(
+            ids=[str(uuid.uuid4())],
+            documents=[text],
+            embeddings=[embedding],
+            metadatas=[metadata or {}],
         )
 
-        return scored[:top_k]
+    # --------------------------------------------------
 
-    # ─────────────────────────────
+    def retrieve(
+        self,
+        query: str,
+        top_k: int = 3,
+    ):
+
+        if self.size == 0:
+            return []
+
+        query_embedding = self.model.encode(
+            query
+        ).tolist()
+
+        results = self.collection.query(
+            query_embeddings=[query_embedding],
+            n_results=top_k,
+        )
+
+        retrieved = []
+
+        docs = results.get("documents", [[]])[0]
+        metas = results.get("metadatas", [[]])[0]
+
+        for doc, meta in zip(docs, metas):
+
+            retrieved.append(
+                {
+                    "text": doc,
+                    "metadata": meta,
+                }
+            )
+
+        return retrieved
+
+    # --------------------------------------------------
 
     def clear(self):
-        self.chunks.clear()
+
+        self.client.delete_collection(
+            "translations"
+        )
+
+        self.collection = (
+            self.client.get_or_create_collection(
+                name="translations"
+            )
+        )
+
+    # --------------------------------------------------
 
     @property
     def size(self):
-        return len(self.chunks)
+
+        return self.collection.count()
